@@ -6,7 +6,7 @@ use flatfs::Flatfs;
 fn main() -> Result<()> {
     let mut args = env::args();
     let path = args.nth(1).unwrap();
-    let n: usize = args.nth(2).unwrap().parse()?;
+    let n: usize = args.next().unwrap().parse()?;
 
     println!("Opening {:?}", path);
 
