@@ -19,6 +19,7 @@ pub struct Flatfs {
 }
 
 const EXTENSION: &str = "data";
+const EXTENSION_WITH_DOT: &str = ".data";
 const DISK_USAGE_CACHE: &str = "disk_usage.cache";
 
 /// Timeout (in ms) for a backoff on retrying operations.
@@ -162,6 +163,81 @@ impl Flatfs {
         write_disk_usage(&self.path, self.disk_usage.load(Ordering::SeqCst))?;
         Ok(())
     }
+
+    /// Iterates over all key, value pairs (in no guranteed order).
+    pub fn iter(&self) -> impl Iterator<Item = Result<(String, Vec<u8>)>> {
+        let read_file = |p: &Path| {
+            let content = fs::read(p)?;
+            let key = key_from_path(p)?;
+
+            Ok((key.to_string(), content))
+        };
+
+        self.walk().filter_map(move |r| match r {
+            Ok(entry) => {
+                if entry.path().is_file() {
+                    Some(read_file(entry.path()))
+                } else {
+                    None
+                }
+            }
+            Err(err) => Some(Err(err.into())),
+        })
+    }
+
+    /// Iterates over all keys (in no guranteed order).
+    pub fn keys(&self) -> impl Iterator<Item = Result<String>> {
+        self.walk().filter_map(move |r| match r {
+            Ok(entry) => {
+                if entry.path().is_file() {
+                    Some(key_from_path(entry.path()))
+                } else {
+                    None
+                }
+            }
+            Err(err) => Some(Err(err.into())),
+        })
+    }
+
+    /// Iterates over all values (in no guranteed order).
+    pub fn values(&self) -> impl Iterator<Item = Result<Vec<u8>>> {
+        self.walk().filter_map(move |r| match r {
+            Ok(entry) => {
+                if entry.path().is_file() {
+                    Some(fs::read(entry.path()).map_err(Into::into))
+                } else {
+                    None
+                }
+            }
+            Err(err) => Some(Err(err.into())),
+        })
+    }
+
+    fn walk(&self) -> ignore::Walk {
+        // Walk the walk
+        let mut typ = ignore::types::TypesBuilder::new();
+        typ.add("data", &format!("*.{EXTENSION}")).unwrap();
+        typ.select("data");
+
+        ignore::WalkBuilder::new(&self.path)
+            .standard_filters(false)
+            .hidden(true)
+            .max_depth(None)
+            .types(typ.build().unwrap())
+            .build()
+    }
+}
+
+fn key_from_path(path: &Path) -> Result<String> {
+    let filename = path
+        .file_name()
+        .ok_or_else(|| eyre!("No filename"))?
+        .to_str()
+        .ok_or_else(|| eyre!("Invalid keyname"))?;
+    let key = filename
+        .strip_suffix(EXTENSION_WITH_DOT)
+        .ok_or_else(|| eyre!("Invalid key: {}", filename))?;
+    Ok(key.to_string())
 }
 
 fn ensure_valid_key(key: &str) -> Result<()> {
@@ -302,6 +378,11 @@ mod tests {
         let flatfs = Flatfs::new(dir.path()).unwrap();
 
         assert_eq!(flatfs.as_path("foobar"), dir.path().join("ba/foobar.data"),);
+
+        assert_eq!(
+            key_from_path(&dir.path().join("ba/foobar.data")).unwrap(),
+            "foobar"
+        );
     }
 
     #[test]
@@ -361,6 +442,35 @@ mod tests {
             } else {
                 assert_eq!(flatfs.get(&format!("foo{i}")).unwrap(), [i; 128]);
             }
+        }
+    }
+
+    #[test]
+    fn test_iter() {
+        let dir = tempfile::tempdir().unwrap();
+        let flatfs = Flatfs::new(dir.path()).unwrap();
+
+        for i in 0..10 {
+            flatfs.put(&format!("foo{i}"), [i; 128]).unwrap();
+        }
+
+        assert_eq!(flatfs.disk_usage(), 10 * 128);
+
+        for r in flatfs.iter() {
+            let (key, value) = r.unwrap();
+            let i: u8 = key.strip_prefix("foo").unwrap().parse().unwrap();
+            assert_eq!(value, [i; 128]);
+        }
+
+        for r in flatfs.keys() {
+            let key = r.unwrap();
+            let i: u8 = key.strip_prefix("foo").unwrap().parse().unwrap();
+            assert!(i < 10);
+        }
+
+        for r in flatfs.values() {
+            let value = r.unwrap();
+            assert_eq!(value.len(), 128);
         }
     }
 }
