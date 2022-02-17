@@ -25,6 +25,12 @@ fn main() -> Result<()> {
                 println!("{:?}", value);
             }
         }
+        "stats" => {
+            for r in flatfs.stats().take(n) {
+                let stats = r?;
+                println!("{:?}", stats);
+            }
+        }
         "keys" => {
             for r in flatfs.keys().take(n) {
                 let key = r?;

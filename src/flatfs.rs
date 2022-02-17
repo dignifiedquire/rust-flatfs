@@ -2,7 +2,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use eyre::{eyre, Result, WrapErr};
@@ -199,6 +199,20 @@ impl Flatfs {
         })
     }
 
+    /// Iterates over all keys and returns stats for them (in no guranteed order).
+    pub fn stats(&self) -> impl Iterator<Item = Result<KvStats>> {
+        self.walk().filter_map(move |r| match r {
+            Ok(entry) => {
+                if entry.path().is_file() {
+                    Some(KvStats::from_path(entry.path()))
+                } else {
+                    None
+                }
+            }
+            Err(err) => Some(Err(err.into())),
+        })
+    }
+
     /// Iterates over all values (in no guranteed order).
     pub fn values(&self) -> impl Iterator<Item = Result<Vec<u8>>> {
         self.walk().filter_map(move |r| match r {
@@ -225,6 +239,28 @@ impl Flatfs {
             .max_depth(None)
             .types(typ.build().unwrap())
             .build()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvStats {
+    pub key: String,
+    pub size: u64,
+    pub path: PathBuf,
+    pub modified: Option<SystemTime>,
+}
+
+impl KvStats {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let key = key_from_path(&path)?;
+        let m = path.metadata()?;
+        Ok(KvStats {
+            key,
+            path,
+            size: m.len(),
+            modified: m.modified().ok(),
+        })
     }
 }
 
