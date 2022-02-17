@@ -1,6 +1,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -9,11 +10,16 @@ use eyre::{eyre, Result, WrapErr};
 use crate::shard::{self, Shard};
 
 pub struct Flatfs {
+    /// Path to the root of the storage on disk.
     path: PathBuf,
+    /// The sharding strategy.
     shard: Shard,
+    /// Current disk usage in bytes.
+    disk_usage: AtomicU64,
 }
 
 const EXTENSION: &str = "data";
+const DISK_USAGE_CACHE: &str = "disk_usage.cache";
 
 /// Timeout (in ms) for a backoff on retrying operations.
 const RETRY_DELAY: u64 = 200;
@@ -64,6 +70,9 @@ impl Flatfs {
             format!("Failed to reaname: {:?} -> {:?}", temp_filepath, filepath)
         })?;
 
+        self.disk_usage
+            .fetch_add(value.len() as u64, Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -95,8 +104,15 @@ impl Flatfs {
         ensure_valid_key(key)?;
         let filepath = self.as_path(key);
 
+        let metadata = filepath
+            .metadata()
+            .wrap_err_with(|| format!("Failed to read metadata for {:?}", filepath))?;
+        let filesize = metadata.len();
+
         retry(|| fs::remove_file(&filepath))
             .wrap_err_with(|| format!("Failed to remove {:?}", filepath))?;
+
+        self.disk_usage.fetch_sub(filesize, Ordering::SeqCst);
 
         Ok(())
     }
@@ -122,9 +138,12 @@ impl Flatfs {
             ));
         }
 
+        let disk_usage = calculate_disk_usage(&path)?;
+
         Ok(Flatfs {
             path: path.as_ref().to_path_buf(),
             shard,
+            disk_usage: AtomicU64::new(disk_usage),
         })
     }
 
@@ -132,6 +151,16 @@ impl Flatfs {
         let mut p = self.path.join(self.shard.dir(key)).join(key);
         p.set_extension(EXTENSION);
         p
+    }
+
+    pub fn disk_usage(&self) -> u64 {
+        self.disk_usage.load(Ordering::SeqCst)
+    }
+
+    /// Safely close the store.
+    pub fn close(&self) -> Result<()> {
+        write_disk_usage(&self.path, self.disk_usage.load(Ordering::SeqCst))?;
+        Ok(())
     }
 }
 
@@ -171,6 +200,64 @@ fn retry<T, E, F: FnMut() -> std::result::Result<T, E>>(mut f: F) -> std::result
     }
 }
 
+impl Drop for Flatfs {
+    fn drop(&mut self) {
+        self.close().expect("failed to close Flatfs");
+    }
+}
+
+fn write_disk_usage<P: AsRef<Path>>(path: P, usage: u64) -> Result<()> {
+    let disk_usage_path = path.as_ref().join(DISK_USAGE_CACHE);
+    fs::write(&disk_usage_path, &usage.to_string()[..])
+        .wrap_err_with(|| format!("Failed to write to {:?}", disk_usage_path))?;
+    Ok(())
+}
+
+fn calculate_disk_usage<P: AsRef<Path>>(path: P) -> Result<u64> {
+    // Check for an existing diskusage file
+    let disk_usage_path = path.as_ref().join(DISK_USAGE_CACHE);
+    if disk_usage_path.exists() {
+        let usage: u64 = fs::read_to_string(&disk_usage_path)
+            .wrap_err_with(|| format!("Failed to read {:?}", disk_usage_path))?
+            .parse()?;
+        return Ok(usage);
+    }
+
+    // Walk the walk
+    let mut typ = ignore::types::TypesBuilder::new();
+    typ.add("data", &format!("*.{EXTENSION}")).unwrap();
+    typ.select("data");
+
+    let walker = ignore::WalkBuilder::new(&path)
+        .standard_filters(false)
+        .hidden(true)
+        .max_depth(None)
+        .types(typ.build().unwrap())
+        .build_parallel();
+
+    let sum = AtomicU64::new(0);
+
+    walker.run(|| {
+        Box::new(|result| match result {
+            Ok(entry) => {
+                if entry.file_type().is_some() && entry.file_type().unwrap().is_file() {
+                    if let Ok(m) = entry.metadata() {
+                        sum.fetch_add(m.len(), Ordering::SeqCst);
+                        return ignore::WalkState::Continue;
+                    }
+                }
+                ignore::WalkState::Continue
+            }
+            Err(_) => ignore::WalkState::Skip,
+        })
+    });
+
+    let disk_usage = sum.load(Ordering::SeqCst);
+    write_disk_usage(path, disk_usage)?;
+
+    Ok(disk_usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,7 +266,7 @@ mod tests {
     fn test_create_empty() {
         let dir = tempfile::tempdir().unwrap();
 
-        let _flatfs = Flatfs::new(dir.path()).unwrap();
+        let flatfs = Flatfs::new(dir.path()).unwrap();
 
         let shard_file_path = dir.path().join("SHARDING");
         assert!(shard_file_path.exists());
@@ -187,6 +274,8 @@ mod tests {
             fs::read_to_string(&shard_file_path).unwrap(),
             Shard::default().to_string(),
         );
+
+        assert_eq!(flatfs.disk_usage(), 0);
     }
 
     #[test]
@@ -216,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_put_get() {
+    fn test_put_get_disk_usage() {
         let dir = tempfile::tempdir().unwrap();
         let flatfs = Flatfs::new(dir.path()).unwrap();
 
@@ -224,10 +313,24 @@ mod tests {
             flatfs.put(&format!("foo{i}"), [i; 128]).unwrap();
         }
 
+        assert_eq!(flatfs.disk_usage(), 10 * 128);
+
         for i in 0..10 {
             assert_eq!(flatfs.get(&format!("foo{i}")).unwrap(), [i; 128]);
             assert_eq!(flatfs.get_size(&format!("foo{i}")).unwrap(), 128);
         }
+
+        drop(flatfs);
+
+        // Reread for size
+        let flatfs = Flatfs::new(dir.path()).unwrap();
+        assert_eq!(flatfs.disk_usage(), 10 * 128);
+
+        drop(flatfs);
+        // Recalculate size
+        fs::remove_file(dir.path().join(DISK_USAGE_CACHE)).unwrap();
+        let flatfs = Flatfs::new(dir.path()).unwrap();
+        assert_eq!(flatfs.disk_usage(), 10 * 128);
     }
 
     #[test]
@@ -239,6 +342,8 @@ mod tests {
             flatfs.put(&format!("foo{i}"), [i; 128]).unwrap();
         }
 
+        assert_eq!(flatfs.disk_usage(), 10 * 128);
+
         for i in 0..10 {
             assert_eq!(flatfs.get(&format!("foo{i}")).unwrap(), [i; 128]);
         }
@@ -246,6 +351,8 @@ mod tests {
         for i in 0..5 {
             flatfs.del(&format!("foo{}", i)).unwrap();
         }
+
+        assert_eq!(flatfs.disk_usage(), 5 * 128);
 
         for i in 0..10 {
             if i < 5 {
