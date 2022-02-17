@@ -1,4 +1,7 @@
-use std::env;
+use std::{
+    env,
+    io::{stdout, Write},
+};
 
 use eyre::{eyre, Result};
 use flatfs::Flatfs;
@@ -29,9 +32,10 @@ fn main() -> Result<()> {
             }
         }
         "values" => {
+            let mut stdout = stdout();
             for r in flatfs.values().take(n) {
                 let value = r?;
-                println!("{:?}", value);
+                stdout.write_all(&value)?;
             }
         }
         _ => return Err(eyre!("Unsupported action: {}", iter)),
